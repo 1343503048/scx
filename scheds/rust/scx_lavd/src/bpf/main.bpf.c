@@ -764,8 +764,11 @@ static void update_stat_for_stopping(struct task_struct *p,
 	/*
 	 * Update per-process preferred LLC domain tracking.
 	 * last_slice_used_wall is already set above, use it as run_ns.
+	 * Gated by is_cache_aware_eligible() to skip kernel threads, pinned
+	 * tasks, and processes with too many threads.
 	 */
-	update_preferred_cpdom(p, taskc, cpuc, taskc->last_slice_used_wall);
+	if (is_cache_aware_eligible(p))
+		update_preferred_cpdom(p, taskc, cpuc, taskc->last_slice_used_wall);
 }
 
 static void update_stat_for_refill(struct task_struct *p,

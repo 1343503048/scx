@@ -595,6 +595,35 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 	 * than task stealing because DSQs are mostly empty (i.e., it is hard
 	 * to steal from a DSQ).
 	 */
+
+	/*
+	 * Cache-aware fast path: if the task has a learned preferred LLC
+	 * different from the sticky domain, and that LLC is currently a
+	 * stealer with an idle CPU, donate the task there before falling
+	 * back to distance-order traversal.  Keeps the task on its warm LLC
+	 * when the load balancer would otherwise spread it elsewhere.
+	 */
+	if (ctx->taskc) {
+		u8 pref = ctx->taskc->preferred_cpdom_id;
+
+		if (cache_aware && pref != LAVD_CA_UNSET_CPDOM && (u64)pref != cpdc->id) {
+			mig_cpdc = MEMBER_VPTR(cpdom_ctxs, [pref]);
+			if (mig_cpdc && READ_ONCE(mig_cpdc->is_stealer)) {
+				cpu = pick_idle_cpu_at_cpdom(ctx, (s64)pref,
+							     scope, is_idle);
+				if (cpu >= 0) {
+					if (no_fast_lb) {
+						WRITE_ONCE(mig_cpdc->is_stealer, false);
+						WRITE_ONCE(cpdc->is_stealee, false);
+					}
+					*sticky_cpdom = (s64)pref;
+					return cpu;
+				}
+			}
+		}
+	}
+
+
 	bpf_for(i, 0, LAVD_CPDOM_MAX_DIST) {
 		nr_nbr = min(cpdc->nr_neighbors[i], LAVD_CPDOM_MAX_NR);
 		if (nr_nbr == 0)
@@ -883,6 +912,41 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle)
 		goto unlock_out;
 	}
 	/* NOTE: There is at least one idle CPU in either active or overflow set. */
+
+	/*
+	 * Cache-aware preferred domain bias.
+	 *
+	 * If the task’s process has built up strong runtime affinity for an LLC
+	 * domain different from the current sticky domain, try to place it on a
+	 * fully-idle core in that preferred domain first.  This mirrors the
+	 * upstream sched/cache wake_affine path that pulls tasks toward the LLC
+	 * where their process is hottest.
+	 *
+	 * Conditions:
+	 *   - preferred_cpdom_id is set (not LAVD_CA_UNSET_CPDOM)
+	 *   - preferred domain differs from sticky domain (otherwise we’re
+	 *     already heading there via the normal path)
+	 *   - task is eligible for cache-aware scheduling
+	 *   - task’s cpumask allows running on that domain
+	 *
+	 * Only a fully-idle core is attempted (SCX_PICK_IDLE_CORE); if none is
+	 * available the logic falls through to the normal placement path, so
+	 * there is no regression for non-cache-aware tasks.
+	 */
+	if (cache_aware && ctx->taskc) {
+		u8 pref = ctx->taskc->preferred_cpdom_id;
+
+		if (pref != LAVD_CA_UNSET_CPDOM &&
+		    (s64)pref != sticky_cpdom &&
+		    can_run_on_domain(ctx, (s64)pref)) {
+			cpu = pick_idle_cpu_at_cpdom(ctx, (s64)pref,
+						     SCX_PICK_IDLE_CORE, is_idle);
+			if (cpu >= 0) {
+				sticky_cpdom = pref;
+				goto unlock_out;
+			}
+		}
+	}
 
 	/*
 	 * So far, it is confirmed that
