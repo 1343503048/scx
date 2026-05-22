@@ -171,6 +171,34 @@ bool is_pinned(const struct task_struct *p)
 	return p->nr_cpus_allowed == 1;
 }
 
+/*
+ * is_cache_aware_eligible - decide whether a task participates in cache-aware
+ * LLC domain tracking and placement.
+ *
+ * Exclusions:
+ *   - cache_aware switch is off
+ *   - kernel threads: no user mm, no data locality to exploit
+ *   - CPU-pinned tasks: no placement freedom
+ *   - processes exceeding cache_aware_max_threads: prevents over-aggregating
+ *     large thread pools onto one LLC domain
+ *
+ * Single-threaded processes are NOT excluded: unlike the upstream sched/cache
+ * which targets inter-thread sharing, scx_lavd keeps any task on its warm LLC.
+ */
+bool is_cache_aware_eligible(struct task_struct __arg_trusted *p)
+{
+	if (!cache_aware)
+		return false;
+	if (is_kernel_task(p))
+		return false;
+	if (is_pinned(p))
+		return false;
+	if (BPF_CORE_READ(p, signal, nr_threads) > (int)cache_aware_max_threads)
+		return false;
+	return true;
+}
+
+
 __hidden
 bool test_task_flag(task_ctx __arg_arena *taskc, u64 flag)
 {

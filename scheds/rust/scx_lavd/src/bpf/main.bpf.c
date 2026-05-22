@@ -210,6 +210,34 @@ struct {
 } mm_ca_map SEC(".maps");
 
 /*
+ * is_cache_aware_eligible - decide whether a task participates in cache-aware
+ * LLC domain tracking and placement.
+ *
+ * Exclusions:
+ *   - cache_aware switch is off
+ *   - kernel threads (no user mm, no data locality to exploit)
+ *   - tasks pinned to a single CPU (no placement freedom)
+ *   - processes with more threads than cache_aware_max_threads (avoids
+ *     over-aggregating a large thread pool onto one LLC domain)
+ *
+ * Note: single-threaded processes are NOT excluded.  Unlike the upstream
+ * implementation (which targets inter-thread sharing), scx_lavd's goal is
+ * to keep any task – including single-threaded ones – on its warm LLC.
+ */
+static __always_inline bool is_cache_aware_eligible(struct task_struct *p)
+{
+	if (!cache_aware)
+		return false;
+	if (is_kernel_task(p))
+		return false;
+	if (is_pinned(p))
+		return false;
+	if (BPF_CORE_READ(p, signal, nr_threads) > (int)cache_aware_max_threads)
+		return false;
+	return true;
+}
+
+/*
  * update_preferred_cpdom - epoch-decay tracking of the hottest LLC domain.
  *
  * Called from update_stat_for_stopping() with the wall-clock slice duration.
@@ -697,8 +725,11 @@ static void update_stat_for_stopping(struct task_struct *p,
 	/*
 	 * Update per-process preferred LLC domain tracking.
 	 * last_slice_used_wall is already set above, use it as run_ns.
+	 * Gated by is_cache_aware_eligible() to skip kernel threads, pinned
+	 * tasks, and processes with too many threads.
 	 */
-	update_preferred_cpdom(p, taskc, cpuc, taskc->last_slice_used_wall);
+	if (is_cache_aware_eligible(p))
+		update_preferred_cpdom(p, taskc, cpuc, taskc->last_slice_used_wall);
 }
 
 static void update_stat_for_refill(struct task_struct *p,
