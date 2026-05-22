@@ -957,9 +957,9 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle)
 	 * Now, let’s consider migrating the task to the sticky domain’s
 	 * neighbor. If there is only one domain, let’s stay at the sticky
 	 * domain.
-	 * 
+	 *
 	 * If there is a fully idle core in the system (i.e., !is_smt_empty),
-	 * let's try to migrate a task to another domain.
+	 * let’s try to migrate a task to another domain.
 	 */
 	if (!i_smt_empty && (nr_cpdoms > 1) &&
 	    (cpdc = MEMBER_VPTR(cpdom_ctxs, [sticky_cpdom])) &&
