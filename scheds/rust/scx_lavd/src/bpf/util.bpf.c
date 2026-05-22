@@ -42,6 +42,10 @@ volatile bool		no_freq_scaling;
 
 const volatile bool	no_wake_sync;
 const volatile bool	no_slice_boost;
+
+/* Cache-aware load balancing. */
+const volatile bool	cache_aware;
+const volatile u32	cache_aware_max_threads = 16;
 const volatile bool	per_cpu_dsq;
 const volatile bool	enable_cpu_bw;
 const volatile bool	is_autopilot_on;
@@ -61,6 +65,7 @@ struct {
 	__type(value, struct cpu_ctx);
 	__uint(max_entries, 1);
 } cpu_ctx_stor SEC(".maps");
+
 
 __hidden
 u64 __get_task_ctx_slowpath(struct task_struct __arg_trusted *p,
