@@ -210,6 +210,103 @@ struct {
 } mm_ca_map SEC(".maps");
 
 /*
+ * update_preferred_cpdom - epoch-decay tracking of the hottest LLC domain.
+ *
+ * Called from update_stat_for_stopping() with the wall-clock slice duration.
+ * Mirrors the epoch-based binary decay from the upstream sched/cache
+ * infrastructure (Tim Chen, Peter Zijlstra, commit 6269a532):
+ *
+ *   - Every LAVD_CA_EPOCH_NS (10 ms) all per-LLC runtime counters are
+ *     right-shifted by the number of elapsed epochs (geometric decay,
+ *     r = 0.5 per epoch).
+ *   - Each LLC accumulates independently; the one with the highest decayed
+ *     runtime is the candidate for preferred domain.
+ *   - 2x hysteresis: candidate must exceed 2x preferred's runtime to switch.
+ *
+ * Tracking all LLCs independently ensures correct behavior when a process
+ * migrates across more than two LLC domains: all domains accumulate time
+ * and the true hottest LLC wins, rather than a single "challenger" being
+ * evicted by each new migration.
+ *
+ * The authoritative state lives in mm_ca_map (shared by all threads of the
+ * process). After each update preferred_cpdom_id is written back to task_ctx
+ * so pick_idle_cpu() can read it without a map lookup.
+ */
+static __always_inline void
+update_preferred_cpdom(struct task_struct *p, task_ctx *taskc,
+		       struct cpu_ctx *cpuc, u64 run_ns)
+{
+	struct mm_ca_stat init_val, *mcs;
+	u32 n, delta, best_runtime, pref_runtime;
+	u8 cur_cpdom, best_cpdom, i;
+	u64 mm_key, now;
+
+	mm_key = (u64)BPF_CORE_READ(p, mm);
+	if (!mm_key)
+		return;
+
+	cur_cpdom = cpuc->cpdom_id;
+	if (cur_cpdom >= LAVD_CA_MAX_CPDOMS)
+		return;
+
+	now = bpf_ktime_get_ns();
+
+	mcs = bpf_map_lookup_elem(&mm_ca_map, &mm_key);
+	if (!mcs) {
+		__builtin_memset(&init_val, 0, sizeof(init_val));
+		init_val.preferred_cpdom_id = cur_cpdom;
+		init_val.last_epoch_ns      = now;
+		bpf_map_update_elem(&mm_ca_map, &mm_key, &init_val, BPF_NOEXIST);
+		taskc->preferred_cpdom_id = cur_cpdom;
+		return;
+	}
+
+	bpf_spin_lock(&mcs->lock);
+
+	/* Step 1: advance epochs, decay all per-LLC runtime counters. */
+	if (now > mcs->last_epoch_ns) {
+		n = (u32)((now - mcs->last_epoch_ns) / LAVD_CA_EPOCH_NS);
+		if (n > 31)
+			n = 31;
+		if (n > 0) {
+			mcs->last_epoch_ns += (u64)n * LAVD_CA_EPOCH_NS;
+			for (i = 0; i < LAVD_CA_MAX_CPDOMS; i++)
+				mcs->cpdom_runtime[i] >>= n;
+		}
+	}
+
+	/* Step 2: accumulate this slice into the current LLC's counter. */
+	delta = (u32)(run_ns >> 10);
+	mcs->cpdom_runtime[cur_cpdom] =
+		min(mcs->cpdom_runtime[cur_cpdom] + delta, (u32)U32_MAX);
+
+	/* Step 3: find the LLC with highest accumulated runtime. */
+	best_cpdom   = 0;
+	best_runtime = 0;
+	for (i = 0; i < LAVD_CA_MAX_CPDOMS; i++) {
+		if (mcs->cpdom_runtime[i] > best_runtime) {
+			best_runtime = mcs->cpdom_runtime[i];
+			best_cpdom   = i;
+		}
+	}
+
+	/* Step 4: 2x hysteresis — switch only if best beats current preferred 2x. */
+	if (best_cpdom != mcs->preferred_cpdom_id) {
+		u8 pref = mcs->preferred_cpdom_id;
+
+		pref_runtime = (pref < LAVD_CA_MAX_CPDOMS) ?
+				mcs->cpdom_runtime[pref] : 0;
+		if (best_runtime > 2 * pref_runtime)
+			mcs->preferred_cpdom_id = best_cpdom;
+	}
+
+	/* Sync to task_ctx cache for zero-cost reads in pick_idle_cpu(). */
+	taskc->preferred_cpdom_id = mcs->preferred_cpdom_id;
+
+	bpf_spin_unlock(&mcs->lock);
+}
+
+/*
  * Logical current clock
  */
 u64		cur_logical_clk = LAVD_DL_COMPETE_WINDOW;
@@ -663,6 +760,12 @@ static void update_stat_for_stopping(struct task_struct *p,
 	 * for a lock holder to be boosted only once.
 	 */
 	reset_lock_futex_boost(taskc, cpuc);
+
+	/*
+	 * Update per-process preferred LLC domain tracking.
+	 * last_slice_used_wall is already set above, use it as run_ns.
+	 */
+	update_preferred_cpdom(p, taskc, cpuc, taskc->last_slice_used_wall);
 }
 
 static void update_stat_for_refill(struct task_struct *p,
@@ -2253,6 +2356,19 @@ s32 BPF_STRUCT_OPS(lavd_exit_task, struct task_struct *p,
 		scx_cgroup_bw_cancel((u64)taskc, SCX_CGROUP_BW_CANCEL_DROP);
 
 	scx_task_free(p);
+
+	/*
+	 * Remove the mm_ca_map entry when the last thread of the process exits.
+	 * nr_threads is checked before the thread is detached, so a value of 1
+	 * means only this thread remains.
+	 */
+	if (!is_kernel_task(p) &&
+	    BPF_CORE_READ(p, signal, nr_threads) <= 1) {
+		u64 mm_key = (u64)BPF_CORE_READ(p, mm);
+		if (mm_key)
+			bpf_map_delete_elem(&mm_ca_map, &mm_key);
+	}
+
 	return 0;
 }
 
