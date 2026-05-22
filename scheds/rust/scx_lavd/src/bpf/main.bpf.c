@@ -197,6 +197,19 @@
 char _license[] SEC("license") = "GPL";
 
 /*
+ * Per-process cache-aware scheduling state.
+ * Keyed by mm_struct pointer (as u64); all threads of the same process share
+ * one entry, matching the per-mm granularity of the upstream sched/cache
+ * infrastructure (Tim Chen, Peter Zijlstra).
+ */
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 4096);
+	__type(key, u64);
+	__type(value, struct mm_ca_stat);
+} mm_ca_map SEC(".maps");
+
+/*
  * Logical current clock
  */
 u64		cur_logical_clk = LAVD_DL_COMPETE_WINDOW;
@@ -2178,6 +2191,14 @@ s32 BPF_STRUCT_OPS_SLEEPABLE(lavd_init_task, struct task_struct *p,
 	WRITE_ONCE(taskc->queued_on_cpu_id, -1);
 	taskc->pid = p->pid;
 	taskc->cgrp_id = args->cgroup->kn->id;
+	/*
+	 * Always start with UNSET so the first stopping call populates the
+	 * correct value from mm_ca_map.  This avoids inheriting a stale
+	 * preferred_cpdom_id from the parent when the child has a different mm
+	 * (new process after exec).  For new threads (same mm), the value will
+	 * be refreshed from the shared mm_ca_map entry on their first stop.
+	 */
+	taskc->preferred_cpdom_id = LAVD_CA_UNSET_CPDOM;
 
 	/* Per-CPU warmth is task+CPU private -- never inherit it. */
 	taskc->cpu_heat = 0;
