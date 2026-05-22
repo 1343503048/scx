@@ -199,6 +199,7 @@ bool is_cache_aware_eligible(struct task_struct __arg_trusted *p)
 }
 
 
+
 __hidden
 bool test_task_flag(task_ctx __arg_arena *taskc, u64 flag)
 {
