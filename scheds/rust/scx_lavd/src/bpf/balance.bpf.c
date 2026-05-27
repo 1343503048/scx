@@ -344,6 +344,26 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 	return pick_dsq_id;
 }
 
+/*
+ * severely_imbalanced - has @src accumulated significantly more per-capacity
+ * load than @dst? Used by try_to_steal_task() to decide whether the
+ * cache-aware steal-resistance heuristic should yield to load balance.
+ *
+ * Returns true when src's per-capacity utilization exceeds dst's by more
+ * than LAVD_CA_IMB_PCT.  Cross-multiplied to avoid division in BPF.
+ */
+static __always_inline bool
+severely_imbalanced(struct cpdom_ctx *src, struct cpdom_ctx *dst)
+{
+	u64 src_cap = src->cap_sum_active_cpus;
+	u64 dst_cap = dst->cap_sum_active_cpus;
+
+	if (!src_cap || !dst_cap)
+		return true;
+	return src->load_invr * dst_cap * 100 >
+	       dst->load_invr * src_cap * (100 + LAVD_CA_IMB_PCT);
+}
+
 static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 {
 	struct cpdom_ctx *cpdomc_pick;
@@ -401,6 +421,83 @@ static bool try_to_steal_task(struct cpdom_ctx *cpdomc)
 			 */
 			if ((s64)dsq_id < 0)
 				continue;
+
+			/*
+			 * Cache-aware steal resistance.  Walk up to
+			 * LAVD_CA_STEAL_SEARCH_DEPTH tasks of this neighbor's
+			 * DSQ and steal the first "wanderer" (preferred LLC !=
+			 * source domain).  If every searched task is at "home",
+			 * apply the load-gated probabilistic skip: a moderately
+			 * loaded source gets a 50% chance to keep its home
+			 * tasks; a severely overloaded source falls through and
+			 * we consume the head for work conservation.  Mirrors
+			 * the per-task LLC filtering of can_migrate_llc_task()
+			 * in upstream sched/cache (commit 53da65f3d59d).
+			 */
+			if (cache_aware) {
+				struct bpf_iter_scx_dsq it;
+				struct task_struct *p;
+				task_ctx *picked_taskc = NULL;
+				bool picked = false;
+				bool any_at_home = false;
+				int k;
+
+				if (bpf_iter_scx_dsq_new(&it, dsq_id, 0) == 0) {
+					bpf_for(k, 0, LAVD_CA_STEAL_SEARCH_DEPTH) {
+						task_ctx *tc;
+
+						p = bpf_iter_scx_dsq_next(&it);
+						if (!p)
+							break;
+
+						tc = get_task_ctx(p);
+						if (!tc)
+							continue;
+
+						if (tc->preferred_cpdom_id == cpdomc_pick->id) {
+							any_at_home = true;
+							continue;
+						}
+
+						/*
+						 * Wanderer found: move it
+						 * directly, bypassing the
+						 * home tasks queued in front.
+						 */
+						if (scx_bpf_dsq_move(&it, p, SCX_DSQ_LOCAL, 0)) {
+							picked = true;
+							picked_taskc = tc;
+						}
+						break;
+					}
+				}
+				bpf_iter_scx_dsq_destroy(&it);
+
+				if (picked) {
+					u64 task_load = no_fast_lb ? 0 :
+						task_load_metric(picked_taskc);
+
+					if (no_fast_lb) {
+						WRITE_ONCE(cpdomc_pick->is_stealee, false);
+						WRITE_ONCE(cpdomc->is_stealer, false);
+					} else {
+						decrement_stealee_budget(cpdomc_pick, task_load);
+						decrement_stealer_budget(cpdomc, task_load);
+					}
+					return true;
+				}
+
+				/*
+				 * No wanderer within search depth.  If we saw
+				 * at least one home task and the source is not
+				 * severely overloaded, give the home tasks a
+				 * 50% chance to stay put.
+				 */
+				if (any_at_home &&
+				    !severely_imbalanced(cpdomc_pick, cpdomc) &&
+				    !prob_x_out_of_y(1, 2))
+					continue;
+			}
 
 			/*
 			 * Peek at the head task to get its size for budget

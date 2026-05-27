@@ -53,6 +53,8 @@ enum {
 	LAVD_CA_EPOCH_NS	= 10000000,	/* 10 ms per epoch (== EPOCH_PERIOD) */
 	LAVD_CA_UNSET_CPDOM	= 0xFF,		/* preferred_cpdom_id sentinel: not yet set */
 	LAVD_CA_MAX_CPDOMS	= 16,		/* max LLC domains tracked per process */
+	LAVD_CA_IMB_PCT		= 20,		/* per-capacity util imbalance %% above which cache affinity yields to load balance */
+	LAVD_CA_STEAL_SEARCH_DEPTH = 16,	/* max DSQ depth searched for a "wanderer" task to steal */
 };
 
 /*
