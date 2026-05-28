@@ -602,7 +602,8 @@ s32 migrate_to_neighbor(struct pick_ctx *ctx, struct cpdom_ctx *cpdc,
 
 		if (cache_aware && pref != LAVD_CA_UNSET_CPDOM && (u64)pref != cpdc->id) {
 			mig_cpdc = MEMBER_VPTR(cpdom_ctxs, [pref]);
-			if (mig_cpdc && READ_ONCE(mig_cpdc->is_stealer)) {
+			if (mig_cpdc && READ_ONCE(mig_cpdc->is_stealer) &&
+			    !cpdom_util_above(mig_cpdc, LAVD_CA_UTIL_LO)) {
 				cpu = pick_idle_cpu_at_cpdom(ctx, (s64)pref,
 							     scope, is_idle);
 				if (cpu >= 0) {
@@ -877,11 +878,17 @@ s32 pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle)
 		if (pref != LAVD_CA_UNSET_CPDOM &&
 		    (s64)pref != sticky_cpdom &&
 		    can_run_on_domain(ctx, (s64)pref)) {
-			cpu = pick_idle_cpu_at_cpdom(ctx, (s64)pref,
-						     SCX_PICK_IDLE_CORE, is_idle);
-			if (cpu >= 0) {
-				sticky_cpdom = pref;
-				goto unlock_out;
+			struct cpdom_ctx *pref_cpdc =
+				MEMBER_VPTR(cpdom_ctxs, [pref]);
+
+			if (pref_cpdc &&
+			    !cpdom_util_above(pref_cpdc, LAVD_CA_UTIL_LO)) {
+				cpu = pick_idle_cpu_at_cpdom(ctx, (s64)pref,
+							     SCX_PICK_IDLE_CORE, is_idle);
+				if (cpu >= 0) {
+					sticky_cpdom = pref;
+					goto unlock_out;
+				}
 			}
 		}
 	}
