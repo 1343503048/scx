@@ -322,6 +322,22 @@ struct cpdom_ctx {
 #define get_neighbor_id(cpdomc, d, i) ((cpdomc)->neighbor_ids[((d) * LAVD_CPDOM_MAX_NR) + (i)])
 
 /*
+ * Test whether the domain's average per-CPU wall utilization exceeds @pct.
+ * Reuses the same metric computed in plan_x_cpdom_migration(): each CPU's
+ * cpu_util_wall is in [0..100], so the sum exceeds pct * nr_active_cpus iff
+ * the per-CPU average exceeds @pct. Cross-multiplied to avoid division.
+ */
+static __always_inline bool
+cpdom_util_above(struct cpdom_ctx *cpdc, u32 pct)
+{
+	u32 acpus = cpdc->nr_active_cpus;
+
+	if (!acpus)
+		return false;
+	return (u64)cpdc->avg_util_wall_sum > (u64)pct * acpus;
+}
+
+/*
  * Atomically subtract @amount from the stealee's egress budget. Concurrent
  * stealers on other CPUs may call this in parallel, so use __sync_fetch_and_sub
  * to avoid race conditions. The signed s64 field lets the counter go slightly

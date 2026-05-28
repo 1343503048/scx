@@ -345,26 +345,6 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 }
 
 /*
- * severely_imbalanced - has @src accumulated significantly more per-capacity
- * load than @dst? Used by try_to_steal_task() to decide whether the
- * cache-aware steal-resistance heuristic should yield to load balance.
- *
- * Returns true when src's per-capacity utilization exceeds dst's by more
- * than LAVD_CA_IMB_PCT.  Cross-multiplied to avoid division in BPF.
- */
-static __attribute__((noinline)) bool
-severely_imbalanced(struct cpdom_ctx *src, struct cpdom_ctx *dst)
-{
-	u64 src_cap = src->cap_sum_active_cpus;
-	u64 dst_cap = dst->cap_sum_active_cpus;
-
-	if (!src_cap || !dst_cap)
-		return true;
-	return src->load_invr * dst_cap * 100 >
-	       dst->load_invr * src_cap * (100 + LAVD_CA_IMB_PCT);
-}
-
-/*
  * steal_wanderer - cache-aware DSQ scan for a "wanderer" task.
  *
  * Walks up to LAVD_CA_STEAL_SEARCH_DEPTH tasks in @dsq_id looking for a task
@@ -431,7 +411,7 @@ steal_wanderer(u64 dsq_id, struct cpdom_ctx *cpdomc, struct cpdom_ctx *cpdomc_pi
 	}
 
 	if (any_at_home &&
-	    !severely_imbalanced(cpdomc_pick, cpdomc) &&
+	    !cpdom_util_above(cpdomc_pick, LAVD_CA_UTIL_HI) &&
 	    !prob_x_out_of_y(1, 2))
 		return -1;
 
