@@ -36,6 +36,7 @@ TMPDIR=""
 
 # Detect perf events: prefer AMD L3 events, fall back to generic
 PERF_MODE="unknown"
+SCHED_EVENTS="context-switches,cpu-migrations"
 AMD_L3_EVENTS="amd_l3/l3_lookup_state.all_coherent_accesses_to_l3/,amd_l3/l3_lookup_state.l3_hit/,amd_l3/l3_lookup_state.l3_miss/"
 GENERIC_EVENTS="cache-misses,LLC-load-misses"
 PERF_EVENTS=""
@@ -48,11 +49,11 @@ detect_perf_events() {
     # Try AMD L3 events first
     if perf stat -a -e "$AMD_L3_EVENTS" sleep 0.01 > /dev/null 2>&1; then
         PERF_MODE="amd_l3"
-        PERF_EVENTS="$AMD_L3_EVENTS"
+        PERF_EVENTS="$AMD_L3_EVENTS,$SCHED_EVENTS"
         echo "  perf: AMD L3 events detected"
     elif perf stat -a -e "$GENERIC_EVENTS" sleep 0.01 > /dev/null 2>&1; then
         PERF_MODE="generic"
-        PERF_EVENTS="$GENERIC_EVENTS"
+        PERF_EVENTS="$GENERIC_EVENTS,$SCHED_EVENTS"
         echo "  perf: generic cache events (non-AMD fallback)"
     else
         PERF_MODE="none"
@@ -128,15 +129,16 @@ echo ""
 # ── Helper functions ──────────────────────────────────────────────
 
 # Parse X-MIG% from lavd stats output
-# Stats format: | MSEQ | ... | X-MIG% | ... |
+# Stats format: | MSEQ | ... | X-MIG% | ... |  (X-MIG% is the 8th data column, $9 in awk)
+# Log contains ANSI color codes which must be stripped first.
 extract_x_mig() {
     local logfile="$1"
-    grep -oP '\|[\s\d]+\|[\s\d]+\|[\s\d]+\|[\s\d]+\|[\s\d]+\|[\s\d.]+\|[\s\d.]+\|\s*[\d.]+\s*\|' \
-        "$logfile" 2>/dev/null \
+    sed 's/\x1b\[[0-9;]*m//g' "$logfile" 2>/dev/null \
+      | grep '^|' \
       | tail -5 \
-      | grep -oP '\|\s*[\d.]+\s*\|' \
-      | head -1 \
-      | tr -d '| ' \
+      | awk -F'|' '{gsub(/^[ \t]+|[ \t]+$/,"",$9); print $9}' \
+      | grep -v '^$' \
+      | tail -1 \
       || echo "N/A"
 }
 
@@ -218,7 +220,7 @@ run_scenario() {
     # Save throughput
     local ops_s
     ops_s=$(grep "^total:" "${out_prefix}_stress.log" 2>/dev/null \
-        | awk '{print $NF}' || echo "N/A")
+        | awk '{print $8}' || echo "N/A")
 
     echo "$xmig"  > "${out_prefix}_xmig"
     echo "$ops_s" > "${out_prefix}_ops_s"
@@ -226,6 +228,14 @@ run_scenario() {
     echo "    ops/s: $ops_s"
 
     # Save perf results per mode
+    local ctx_sw cpu_mig
+    ctx_sw=$(extract_perf_event "${out_prefix}_perf.log" "context-switches")
+    cpu_mig=$(extract_perf_event "${out_prefix}_perf.log" "cpu-migrations")
+    echo "$ctx_sw"  > "${out_prefix}_ctx_sw"
+    echo "$cpu_mig" > "${out_prefix}_cpu_mig"
+    echo "    context-switches: $ctx_sw"
+    echo "    cpu-migrations:   $cpu_mig"
+
     if [ "$PERF_MODE" = "amd_l3" ]; then
         local l3_all l3_hit l3_miss l3_hit_rate
         l3_all=$(extract_perf_event "${out_prefix}_perf.log" "l3_lookup_state.all_coherent_accesses_to_l3")
@@ -291,6 +301,10 @@ BL_XMIG=$(cat "${TMPDIR}/baseline_xmig" 2>/dev/null || echo "N/A")
 BL_OPS=$(cat "${TMPDIR}/baseline_ops_s" 2>/dev/null || echo "N/A")
 CA_XMIG=$(cat "${TMPDIR}/ca_on_xmig" 2>/dev/null || echo "N/A")
 CA_OPS=$(cat "${TMPDIR}/ca_on_ops_s" 2>/dev/null || echo "N/A")
+BL_CTX=$(cat "${TMPDIR}/baseline_ctx_sw" 2>/dev/null || echo "N/A")
+BL_MIG=$(cat "${TMPDIR}/baseline_cpu_mig" 2>/dev/null || echo "N/A")
+CA_CTX=$(cat "${TMPDIR}/ca_on_ctx_sw" 2>/dev/null || echo "N/A")
+CA_MIG=$(cat "${TMPDIR}/ca_on_cpu_mig" 2>/dev/null || echo "N/A")
 
 printf "%-18s %14s %14s\n" "Metric" "Baseline" "CA-on"
 printf "%-18s %14s %14s\n" "------------------" "--------------" "--------------"
@@ -301,6 +315,14 @@ fmt_val "$CA_XMIG"; printf "\n"
 printf "%-18s " "ops/s"
 fmt_val "$BL_OPS"; printf " "
 fmt_val "$CA_OPS"; printf "\n"
+
+printf "%-18s " "context-switches"
+fmt_val "$BL_CTX"; printf " "
+fmt_val "$CA_CTX"; printf "\n"
+
+printf "%-18s " "cpu-migrations"
+fmt_val "$BL_MIG"; printf " "
+fmt_val "$CA_MIG"; printf "\n"
 
 if [ "$PERF_MODE" = "amd_l3" ]; then
     BL_L3_HR=$(cat "${TMPDIR}/baseline_l3_hit_rate" 2>/dev/null || echo "N/A")
@@ -346,6 +368,8 @@ echo ""
 echo "============================================"
 echo " Interpretation:"
 echo "   X-MIG%:     lower is better (less cross-domain migration)"
+echo "   ctx-sw:     lower is better (fewer context switches)"
+echo "   cpu-mig:    lower is better (fewer CPU migrations)"
 if [ "$PERF_MODE" = "amd_l3" ]; then
     echo "   L3 hit rate: higher is better (better cache locality)"
     echo "   L3 misses:  lower is better"
