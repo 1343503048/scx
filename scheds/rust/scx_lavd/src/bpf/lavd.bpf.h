@@ -230,6 +230,13 @@ struct task_ctx {
 	u32	queued_load_snapshot;	/* task_load_metric() value snapshotted at enqueue time */
 	pid_t	pid;			/* pid for this task */
 	pid_t	waker_pid;		/* last waker's PID */
+	/*
+	 * Read cache for mm_ca_stat.preferred_cpdom_id.  Written by
+	 * update_preferred_cpdom() in the stopping path; read zero-cost by
+	 * pick_idle_cpu() in the wakeup path.  The authoritative value lives
+	 * in mm_ca_map keyed by p->mm, shared across all threads of a process.
+	 */
+	u8	preferred_cpdom_id;	/* LAVD_CA_UNSET_CPDOM if not yet determined */
 
 	/* --- cacheline 4 boundary (256 bytes) --- */
 	u32	util_est;		/* Estimated task util using ravg duty cycle */
@@ -291,6 +298,22 @@ struct cpdom_ctx {
 } __attribute__((aligned(CACHELINE_SIZE)));
 
 #define get_neighbor_id(cpdomc, d, i) ((cpdomc)->neighbor_ids[((d) * LAVD_CPDOM_MAX_NR) + (i)])
+
+/*
+ * Test whether the domain's average per-CPU wall utilization exceeds @pct.
+ * Reuses the same metric computed in plan_x_cpdom_migration(): each CPU's
+ * cpu_util_wall is in [0..100], so the sum exceeds pct * nr_active_cpus iff
+ * the per-CPU average exceeds @pct. Cross-multiplied to avoid division.
+ */
+static __always_inline bool
+cpdom_util_above(struct cpdom_ctx *cpdc, u32 pct)
+{
+	u32 acpus = cpdc->nr_active_cpus;
+
+	if (!acpus)
+		return false;
+	return (u64)cpdc->avg_util_wall_sum > (u64)pct * acpus;
+}
 
 /*
  * Atomically subtract @amount from the stealee's egress budget. Concurrent
@@ -530,6 +553,19 @@ struct cpu_ctx {
 	volatile u32	util_est;	/* Estimated CPU utilization from ravg tracking */
 } __attribute__((aligned(CACHELINE_SIZE)));
 
+/*
+ * Per-process cache-aware scheduling state, stored in mm_ca_map keyed by
+ * the mm_struct pointer.  All threads of the same process share one entry,
+ * matching the per-mm granularity of the upstream sched/cache infrastructure.
+ */
+struct mm_ca_stat {
+	struct bpf_spin_lock	lock;
+	u8	preferred_cpdom_id;			/* LLC domain with highest accumulated runtime */
+	u8	__pad[3];
+	u32	cpdom_runtime[LAVD_CA_MAX_CPDOMS];	/* per-LLC decayed runtime (ns >> 10) */
+	u64	last_epoch_ns;				/* timestamp of the last epoch advance */
+};
+
 extern const volatile u64	nr_llcs;	/* number of LLC domains */
 const extern volatile u32	nr_cpu_ids;
 extern volatile u64		nr_cpus_onln;	/* current number of online CPUs */
@@ -542,6 +578,10 @@ extern const volatile u8	cpu_turbo[LAVD_CPU_ID_MAX];
 
 extern const volatile bool	no_wake_sync;
 extern const volatile bool	no_slice_boost;
+
+/* Cache-aware load balancing. */
+extern const volatile bool	cache_aware;
+extern const volatile u32	cache_aware_max_threads;
 extern const volatile u8	verbose;
 
 #define debugln(fmt, ...)						\
