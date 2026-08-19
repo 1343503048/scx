@@ -939,6 +939,18 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 		 * cpdom DSQ, never the local DSQ it was just drained from.
 		 */
 		cpu = taskc->suggested_cpu_id;
+		/*
+		 * suggested_cpu_id may be stale if the task's CPU affinity
+		 * changed since it was cached (e.g., migrate_disable narrowed
+		 * cpus_ptr, or sched_setaffinity changed the mask). The cached
+		 * CPU may no longer be in cpus_ptr, routing the task to a DSQ
+		 * whose owner cannot run it. Clamp to cpus_ptr.
+		 */
+		if (cpu < 0 || cpu >= nr_cpu_ids ||
+		    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+			cpu = bpf_cpumask_first(p->cpus_ptr);
+			taskc->suggested_cpu_id = cpu;
+		}
 		cpuc = get_cpu_ctx_id(cpu);
 		if (!cpuc) {
 			scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
