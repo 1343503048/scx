@@ -333,39 +333,166 @@ u64 __attribute__((noinline)) pick_most_loaded_dsq(struct cpdom_ctx *cpdomc)
 }
 
 /*
- * steal_wanderer - cache-aware DSQ scan for a "wanderer" task.
+ * ca_home_dsq - the home (preferred-LLC) DSQ of @p, if usable.
  *
- * Walks up to LAVD_CA_STEAL_SEARCH_DEPTH tasks in @dsq_id looking for a task
- * whose preferred LLC domain differs from @cpdomc_pick (i.e., it doesn't
- * belong here).  Three outcomes:
+ * Returns cpdom_to_dsq(preferred) only when the preferred domain is known
+ * and valid and @p's affinity actually reaches at least one CPU of that
+ * domain; returns 0 otherwise. Zero is never a valid domain DSQ id since
+ * the DSQ type bits are always non-zero. The caller supplies @p's task
+ * context so no redundant lookup is needed.
+ */
+static __always_inline u64
+ca_home_dsq(struct task_struct *p, task_ctx *taskc)
+{
+	struct cpdom_ctx *cpdomc;
+	struct bpf_cpumask *cpd_mask;
+	u8 pref;
+
+	pref = taskc->preferred_cpdom_id;
+	if (pref == LAVD_CA_UNSET_CPDOM)
+		return 0;
+
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [pref]);
+	if (!cpdomc || !cpdomc->is_valid)
+		return 0;
+
+	cpd_mask = MEMBER_VPTR(cpdom_cpumask, [pref]);
+	if (!cpd_mask ||
+	    !bpf_cpumask_intersects(p->cpus_ptr, cast_mask(cpd_mask)))
+		return 0;
+
+	return cpdom_to_dsq((u64)pref);
+}
+
+/*
+ * ca_dsq_move - move @p from DSQ iteration @it to @dsq_id using the
+ * protocol the kernel expects for the target DSQ type.
  *
- *   > 0  Wanderer found, moved to SCX_DSQ_LOCAL, budgets decremented.
- *        Caller should return true (steal done).
- *   < 0  Only home tasks seen and heuristic says keep them; caller skips DSQ.
- *   = 0  Fall through to normal head-of-DSQ consume.
+ * The two move kfuncs must not be mixed: a vtime (PRIQ) move into a
+ * built-in DSQ triggers scx_error("cannot use vtime ordering for built-in
+ * DSQs") — an outright scheduler abort — and a plain FIFO move into a
+ * vtime-ordered user DSQ mixes ordering classes, which the kernel also
+ * rejects. So a domain (user, vtime) DSQ must be moved to with
+ * set_slice + set_vtime + move_vtime, and SCX_DSQ_LOCAL must be moved to
+ * with the plain FIFO move. The explicit set_slice() also clears any
+ * stale slice override a previous move on the same iterator may have
+ * staged in the iterator.
+ */
+static __always_inline bool
+ca_dsq_move(struct bpf_iter_scx_dsq *it, struct task_struct *p, u64 dsq_id)
+{
+	if (dsq_id == SCX_DSQ_LOCAL) {
+		scx_bpf_dsq_move_set_slice(it, p->scx.slice);
+		return scx_bpf_dsq_move(it, p, SCX_DSQ_LOCAL, 0);
+	}
+
+	scx_bpf_dsq_move_set_slice(it, p->scx.slice);
+	scx_bpf_dsq_move_set_vtime(it, p->scx.dsq_vtime);
+	return scx_bpf_dsq_move_vtime(it, p, dsq_id, 0);
+}
+
+/*
+ * ca_head_is_home - should the head task of @dsq_id be left at its home
+ * domain?
  *
- * Uses a plain for loop (not bpf_loop) to stay within the BPF 8-frame call
- * depth limit.  State explosion is no longer a concern here because
- * try_steal_inner_cb is a bpf_loop callback, so the verifier analyses this
- * function from a single abstract call site (not 3×128 for-loop states).
+ * Peeks only the DSQ head: if the head's preferred domain is
+ * @cpdomc_pick itself (the task is "at home") and the source domain still
+ * has more than LAVD_CA_KEEP_REQ of its capacity unused (util < 95%), the
+ * task's cache affinity wins over load balancing and the caller must not
+ * steal from this DSQ. Only once the domain is virtually saturated may
+ * its home tasks be stolen out.
+ */
+static __attribute__((noinline)) bool
+ca_head_is_home(u64 dsq_id, struct cpdom_ctx *cpdomc_pick)
+{
+	struct task_struct *p;
+	task_ctx *taskc;
+
+	if (!cache_aware)
+		return false;
+
+	p = __COMPAT_scx_bpf_dsq_peek(dsq_id);
+	if (!p)
+		return false;
+
+	taskc = get_task_ctx(p);
+	if (!taskc)
+		return false;
+
+	return taskc->preferred_cpdom_id != LAVD_CA_UNSET_CPDOM &&
+	       (u64)taskc->preferred_cpdom_id == cpdomc_pick->id &&
+	       cpdom_headroom_above(cpdomc_pick, LAVD_CA_KEEP_REQ);
+}
+
+/*
+ * steal_wanderer - cache-aware DSQ scan for "wanderer" tasks.
+ *
+ * Walks up to LAVD_CA_STEAL_SEARCH_DEPTH tasks in @dsq_id looking for
+ * tasks whose preferred LLC domain differs from @cpdomc_pick (the source
+ * domain), i.e., tasks that do not belong here. Outcomes:
+ *
+ *   > 0  A wanderer heading home to @cpdomc (the stealer) was moved to
+ *        SCX_DSQ_LOCAL and both budgets were decremented. The caller
+ *        should return true (steal done).
+ *   = 0  Nothing was taken for the stealer itself; the caller falls
+ *        through — ca_head_is_home() may then intercept, otherwise the
+ *        normal head-of-DSQ consume decides. Side effect: zero or more
+ *        wanderers heading to third domains may have been redirected
+ *        back to their home domain DSQ ("send-back"), each decrementing
+ *        only the stealee (egress) budget of the source domain.
+ *
+ * Details:
+ *   - Head fast path: the DSQ head is peeked first. When it is at home
+ *     or untracked, the iterator is not even created — those cases are
+ *     handled by the caller's interception/normal consume — so an
+ *     undisturbed DSQ costs one peek, not an iterator setup plus scan.
+ *   - LOCAL target affinity check: a task moved to SCX_DSQ_LOCAL must be
+ *     able to run on the stealing CPU, otherwise the kernel's dispatch
+ *     path aborts the scheduler. Checked before every LOCAL move.
+ *   - Send-back redirection: a wanderer whose home is a third domain —
+ *     or one that cannot run on this CPU even though it is heading
+ *     home — is moved to its home domain's vtime DSQ instead, so it
+ *     converges to its warm LLC without our CPU having to run it.
+ *
+ * Uses a plain for loop (not bpf_loop) to stay within the BPF 8-frame
+ * call depth limit. noinline so the verifier analyses it from a single
+ * abstract call site.
  */
 static __attribute__((noinline)) int
 steal_wanderer(u64 dsq_id, struct cpdom_ctx *cpdomc, struct cpdom_ctx *cpdomc_pick)
 {
 	struct bpf_iter_scx_dsq it;
 	task_ctx *picked_taskc = NULL;
+	struct task_struct *head;
 	bool picked = false;
-	bool any_at_home = false;
+	u32 cpu_cur;
 	int k;
 
+	/* Head fast path. */
+	head = __COMPAT_scx_bpf_dsq_peek(dsq_id);
+	if (!head)
+		return 0;
+
+	picked_taskc = get_task_ctx(head);
+	if (!picked_taskc)
+		return 0;
+
+	if (picked_taskc->preferred_cpdom_id == cpdomc_pick->id ||
+	    picked_taskc->preferred_cpdom_id == LAVD_CA_UNSET_CPDOM)
+		return 0;	/* head at home or untracked */
+
+	/* The head is a wanderer: scan (head first) for actionable tasks. */
 	if (bpf_iter_scx_dsq_new(&it, dsq_id, 0) != 0) {
 		bpf_iter_scx_dsq_destroy(&it);
 		return 0;
 	}
 
+	cpu_cur = bpf_get_smp_processor_id();
+
 	for (k = 0; k < LAVD_CA_STEAL_SEARCH_DEPTH; k++) {
 		struct task_struct *p;
 		task_ctx *tc;
+		u64 home_dsq;
 
 		p = bpf_iter_scx_dsq_next(&it);
 		if (!p)
@@ -375,16 +502,36 @@ steal_wanderer(u64 dsq_id, struct cpdom_ctx *cpdomc, struct cpdom_ctx *cpdomc_pi
 		if (!tc)
 			continue;
 
-		if (tc->preferred_cpdom_id == cpdomc_pick->id) {
-			any_at_home = true;
+		/* At home here, or not tracked: leave for the normal path. */
+		if (tc->preferred_cpdom_id == cpdomc_pick->id ||
+		    tc->preferred_cpdom_id == LAVD_CA_UNSET_CPDOM)
 			continue;
+
+		/*
+		 * A wanderer heading home to us: take it on this CPU,
+		 * after checking it can actually run here.
+		 */
+		if (tc->preferred_cpdom_id == cpdomc->id &&
+		    bpf_cpumask_test_cpu(cpu_cur, p->cpus_ptr)) {
+			if (ca_dsq_move(&it, p, SCX_DSQ_LOCAL)) {
+				picked = true;
+				picked_taskc = tc;
+				break;
+			}
+			continue;	/* raced away; keep scanning */
 		}
 
-		if (scx_bpf_dsq_move(&it, p, SCX_DSQ_LOCAL, 0)) {
-			picked = true;
-			picked_taskc = tc;
-		}
-		break;
+		/*
+		 * A wanderer heading elsewhere (or home to us but not
+		 * runnable here): send it back to its home domain's
+		 * vtime DSQ. It left the source domain, so only the
+		 * stealee (egress) budget is decremented.
+		 */
+		home_dsq = ca_home_dsq(p, tc);
+		if (home_dsq && ca_dsq_move(&it, p, home_dsq) &&
+		    !no_fast_lb)
+			decrement_stealee_budget(cpdomc_pick,
+						 task_load_metric(tc));
 	}
 	bpf_iter_scx_dsq_destroy(&it);
 
@@ -401,11 +548,10 @@ steal_wanderer(u64 dsq_id, struct cpdom_ctx *cpdomc, struct cpdom_ctx *cpdomc_pi
 		return 1;
 	}
 
-	if (any_at_home &&
-	    !cpdom_util_above(cpdomc_pick, LAVD_CA_UTIL_HI) &&
-	    !prob_x_out_of_y(1, 2))
-		return -1;
-
+	/*
+	 * Our CPU still needs a task (redirections do not run here):
+	 * fall through so the caller can intercept or consume.
+	 */
 	return 0;
 }
 
@@ -420,6 +566,13 @@ steal_wanderer(u64 dsq_id, struct cpdom_ctx *cpdomc, struct cpdom_ctx *cpdomc_pi
  *   → try_steal_flat_cb(3) → steal_wanderer(4)
  *   → __get_task_ctx_slowpath(5) → scx_task_data(6)
  *   → scx_arena_subprog_init(7)          ← 8 frames, at limit
+ *
+ * force_to_steal_task() follows the same flat-callback pattern
+ * (force_steal_flat_cb): a plain nested for loop inlined into
+ * ops.dispatch() makes the verifier's pending-state stack of the
+ * lavd_dispatch walk exceed the 8192 jump-sequence limit once the
+ * cache-aware insertion points are in the loop body, while the
+ * bpf_loop callback is explored as a bounded, separate state subtree.
  *
  * Within the callback:
  *   i = idx / LAVD_CPDOM_MAX_NR   (distance level)
@@ -495,13 +648,27 @@ static int try_steal_flat_cb(u32 idx, void *data)
 
 	dsq_id = pick_most_loaded_dsq(cpdomc_pick);
 
-	if (cache_aware) {
-		int ret = steal_wanderer(dsq_id, cpdomc, cpdomc_pick);
-		if (ret > 0) {
+	/*
+	 * Cache-aware steal, gated by the overhead door: only domains that
+	 * received an enqueue within the last sys_stat interval
+	 * (ca_tracked_active) can hold tracked tasks worth scanning.
+	 */
+	if (cache_aware && READ_ONCE(cpdomc_pick->ca_tracked_active)) {
+		/*
+		 * Steal a wanderer heading home to us, or send wanderers
+		 * back to their home domains (budgets decremented inside).
+		 */
+		if (steal_wanderer(dsq_id, cpdomc, cpdomc_pick) > 0) {
 			ctx->stolen = true;
 			return 1;
 		}
-		if (ret < 0)
+
+		/*
+		 * Fall-through interception: the head task is at home in
+		 * the source domain and the domain still has headroom —
+		 * keep it there and try the next neighbor.
+		 */
+		if (ca_head_is_home(dsq_id, cpdomc_pick))
 			return 0;
 	}
 
@@ -545,66 +712,151 @@ static __attribute__((noinline)) bool try_to_steal_task(struct cpdom_ctx *cpdomc
 	return ctx.stolen;
 }
 
-static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
+/*
+ * Cache-aware noinline wrappers for the force-steal path.
+ *
+ * Both are called from force_steal_flat_cb(), a bpf_loop callback verified
+ * as its own state subtree. Keeping them noinline is still essential: the
+ * force path folds a LAVD_CPDOM_MAX_DIST x LAVD_CPDOM_MAX_NR neighbor
+ * traversal into ops.dispatch(), and inlining the cache-aware peek/scan
+ * bodies there explodes the verifier's pending-state stack past the 8192
+ * jump-sequence limit (BPF_COMPLEXITY_LIMIT_JMP_SEQ) for the lavd_dispatch
+ * program — measured on the dispatch path as roughly 2x dispatch overhead
+ * when the scans ran ungated. The wrappers stay a cheap gated branch —
+ * skipped entirely unless the source domain was recently tracked
+ * (ca_tracked_active) — on every iteration.
+ */
+static __attribute__((noinline)) bool
+ca_force_head_is_home(u64 dsq_id, struct cpdom_ctx *cpdomc_pick)
 {
-	struct cpdom_ctx *cpdomc_pick;
-	s64 nr_nbr, cpdom_id;
+	if (!cache_aware || !READ_ONCE(cpdomc_pick->ca_tracked_active))
+		return false;
+	return ca_head_is_home(dsq_id, cpdomc_pick);
+}
 
-	/*
-	 * Traverse neighbor compute domains in distance order.
-	 */
-	for (int i = 0; i < LAVD_CPDOM_MAX_DIST; i++) {
-		nr_nbr = min(cpdomc->nr_neighbors[i], LAVD_CPDOM_MAX_NR);
+static __attribute__((noinline)) bool
+ca_force_home(u64 dsq_id, struct cpdom_ctx *cpdomc,
+	      struct cpdom_ctx *cpdomc_pick)
+{
+	if (!cache_aware || !READ_ONCE(cpdomc_pick->ca_tracked_active))
+		return false;
+	return steal_wanderer(dsq_id, cpdomc, cpdomc_pick) > 0;
+}
+
+/*
+ * Force-steal flat callback: idx -> (i, j) decomposition over
+ * LAVD_CPDOM_MAX_DIST x LAVD_CPDOM_MAX_NR neighbors, identical to
+ * try_steal_flat_cb() (see the comment there). force_to_steal_task()
+ * used to be a plain nested for loop inlined into ops.dispatch(); that
+ * was fine while its per-iteration body was small, but the cache-aware
+ * insertion points below made the pending-state stack of the
+ * lavd_dispatch verification walk exceed the 8192 jump-sequence limit.
+ * The flat bpf_loop callback restores a bounded, separately explored
+ * verification subtree.
+ */
+struct force_steal_flat_ctx {
+	u64  cpdomc_id;
+	bool stolen;
+};
+
+static int force_steal_flat_cb(u32 idx, void *data)
+{
+	struct force_steal_flat_ctx *ctx = data;
+	struct cpdom_ctx *cpdomc, *cpdomc_pick;
+	s64 cpdom_id, nr_nbr;
+	u64 dsq_id, task_load;
+	u32 i, j;
+
+	/* bpf_loop does not constrain idx in the verifier. */
+	if (idx >= LAVD_CPDOM_MAX_DIST * LAVD_CPDOM_MAX_NR)
+		return 1;
+
+	i = idx / LAVD_CPDOM_MAX_NR;   /* i < LAVD_CPDOM_MAX_DIST */
+	j = idx % LAVD_CPDOM_MAX_NR;   /* j < LAVD_CPDOM_MAX_NR   */
+
+	cpdomc = MEMBER_VPTR(cpdom_ctxs, [ctx->cpdomc_id]);
+	if (!cpdomc)
+		return 1;
+
+	nr_nbr = cpdomc->nr_neighbors[i];
+
+	if (j == 0) {
+		/* Mirror outer-loop break: no neighbors at this distance. */
 		if (nr_nbr == 0)
-			break;
-
-		/*
-		 * Traverse neighbors in the same distance in circular distance order.
-		 */
-		for (int j = 0; j < LAVD_CPDOM_MAX_NR; j++) {
-			u64 dsq_id;
-			if (j >= nr_nbr)
-				break;
-
-			cpdom_id = get_neighbor_id(cpdomc, i, j);
-			if (cpdom_id < 0)
-				continue;
-
-			cpdomc_pick = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
-			if (!cpdomc_pick) {
-				scx_bpf_error("Failed to lookup cpdom_ctx for %llu", cpdom_id);
-				return false;
-			}
-
-			if (!cpdomc_pick->is_valid)
-				continue;
-
-			dsq_id = pick_most_loaded_dsq(cpdomc_pick);
-
-			/*
-			 * Peek at the head task to get its size. Skip the
-			 * peek when no_fast_lb is set since the budget
-			 * accounting below is bypassed and the value would
-			 * be unused.
-			 */
-			u64 task_load = no_fast_lb ? 0 : dsq_peek_task_load(dsq_id);
-
-			/*
-			 * Force steal is unconditional for work
-			 * conservation. Decrement budgets to keep
-			 * the accounting consistent.
-			 */
-			if (consume_dsq(cpdomc_pick, dsq_id)) {
-				if (!no_fast_lb) {
-					decrement_stealee_budget(cpdomc_pick, task_load);
-					decrement_stealer_budget(cpdomc, task_load);
-				}
-				return true;
-			}
-		}
+			return 1;
 	}
 
-	return false;
+	/* Skip j values beyond the actual neighbor count for this distance. */
+	if ((s64)j >= nr_nbr)
+		return 0;
+
+	cpdom_id = get_neighbor_id(cpdomc, i, j);
+	if (cpdom_id < 0)
+		return 0;
+
+	cpdomc_pick = MEMBER_VPTR(cpdom_ctxs, [cpdom_id]);
+	if (!cpdomc_pick) {
+		scx_bpf_error("Failed to lookup cpdom_ctx for %lld", cpdom_id);
+		return 1;
+	}
+
+	if (!cpdomc_pick->is_valid)
+		return 0;
+
+	dsq_id = pick_most_loaded_dsq(cpdomc_pick);
+
+	/*
+	 * Insertion point 1: opportunistically steal a wanderer heading
+	 * home to this domain; budgets are decremented inside
+	 * steal_wanderer().
+	 */
+	if (ca_force_home(dsq_id, cpdomc, cpdomc_pick)) {
+		ctx->stolen = true;
+		return 1;
+	}
+
+	/*
+	 * Insertion point 2: keep the head task at its home domain when it
+	 * belongs there and the domain still has headroom; try the next
+	 * neighbor instead.
+	 */
+	if (ca_force_head_is_home(dsq_id, cpdomc_pick))
+		return 0;
+
+	/*
+	 * Peek at the head task to get its size. Skip the peek when
+	 * no_fast_lb is set since the budget accounting below is bypassed
+	 * and the value would be unused.
+	 */
+	task_load = no_fast_lb ? 0 : dsq_peek_task_load(dsq_id);
+
+	/*
+	 * Force steal is unconditional for work conservation. Decrement
+	 * budgets to keep the accounting consistent.
+	 */
+	if (consume_dsq(cpdomc_pick, dsq_id)) {
+		if (!no_fast_lb) {
+			decrement_stealee_budget(cpdomc_pick, task_load);
+			decrement_stealer_budget(cpdomc, task_load);
+		}
+		ctx->stolen = true;
+		return 1;
+	}
+
+	return 0;
+}
+
+static bool force_to_steal_task(struct cpdom_ctx *cpdomc)
+{
+	struct force_steal_flat_ctx ctx = {
+		.cpdomc_id = cpdomc->id,
+		.stolen    = false,
+	};
+
+	bpf_loop(LAVD_CPDOM_MAX_DIST * LAVD_CPDOM_MAX_NR,
+		 force_steal_flat_cb, &ctx, 0);
+
+	return ctx.stolen;
 }
 
 __hidden

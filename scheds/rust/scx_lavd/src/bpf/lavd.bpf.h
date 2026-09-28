@@ -232,9 +232,11 @@ struct task_ctx {
 	pid_t	waker_pid;		/* last waker's PID */
 	/*
 	 * Read cache for mm_ca_stat.preferred_cpdom_id.  Written by
-	 * update_preferred_cpdom() in the stopping path; read zero-cost by
-	 * pick_idle_cpu() in the wakeup path.  The authoritative value lives
-	 * in mm_ca_map keyed by p->mm, shared across all threads of a process.
+	 * update_preferred_cpdom() in the stopping path and refreshed by
+	 * lavd_tick() (covers CPU-bound threads that rarely stop); read
+	 * zero-cost by pick_idle_cpu() in the wakeup path.  The authoritative
+	 * value lives in mm_ca_map keyed by p->mm, shared across all threads
+	 * of a process.
 	 */
 	u8	preferred_cpdom_id;	/* LAVD_CA_UNSET_CPDOM if not yet determined */
 
@@ -293,6 +295,21 @@ struct cpdom_ctx {
 	u16	nr_steady_cpus;		    /* count of steady CPUs in this cpdom */
 	u16	nr_turb_cpus;		    /* count of turbulent CPUs in this cpdom */
 
+	/* per-cpdom cache-aware occupancy denominator + overhead gate */
+	u32	ca_total_task_time;		    /* decayed runtime of all tracked tasks in this
+						     * domain (ns >> 10); denominator of the per-process
+						     * occupancy ranking, decayed every LAVD_CA_EPOCH_NS
+						     * via ca_denom_epoch_ns (same r=0.5 schedule as the
+						     * per-mm cpdom_runtime[]) */
+	u64	ca_denom_epoch_ns;		    /* last epoch advance of ca_total_task_time */
+	u8	ca_tracked_active;		    /* cache-aware heartbeat: set at enqueue in
+						     * get_target_dsq_id() only by tasks carrying a
+						     * preferred-LLC hint (read-before-write),
+						     * cleared every sys_stat interval in
+						     * collect_sys_stat(); gates the cache-aware
+						     * steal-path logic so it is skipped on
+						     * untracked domains */
+
 	s64	stealee_budget_invr;		    /* egress budget: how much load can leave this domain per round */
 	s64	stealer_budget_invr;		    /* ingress budget: how much additional load this stealer can accept */
 } __attribute__((aligned(CACHELINE_SIZE)));
@@ -300,19 +317,29 @@ struct cpdom_ctx {
 #define get_neighbor_id(cpdomc, d, i) ((cpdomc)->neighbor_ids[((d) * LAVD_CPDOM_MAX_NR) + (i)])
 
 /*
- * Test whether the domain's average per-CPU wall utilization exceeds @pct.
- * Reuses the same metric computed in plan_x_cpdom_migration(): each CPU's
- * cpu_util_wall is in [0..100], so the sum exceeds pct * nr_active_cpus iff
- * the per-CPU average exceeds @pct. Cross-multiplied to avoid division.
+ * Test whether the domain has more than @req (in LAVD_SHIFT fixed point,
+ * p2s(x) == x%) of its total capacity still unused. The average wall
+ * utilization sum (per CPU in [0..1024], summed over the domain) is
+ * compared against the total capacity of all online CPUs in the domain
+ * (cap_sum_steady + cap_sum_turb, also in [0..1024] per CPU), so big/little
+ * cores and partially online domains are weighed correctly — unlike a
+ * per-CPU average utilization check. Cross-multiplied to avoid division:
+ *
+ *   headroom fraction > req/1024
+ *     <=>  avg_util_wall_sum * 1024 < (1024 - req) * cap
+ *
+ * Returns false when capacity statistics are not available yet (cap == 0),
+ * i.e., "no headroom can be proven".
  */
 static __always_inline bool
-cpdom_util_above(struct cpdom_ctx *cpdc, u32 pct)
+cpdom_headroom_above(struct cpdom_ctx *cpdc, u32 req)
 {
-	u32 acpus = cpdc->nr_active_cpus;
+	u32 cap = cpdc->cap_sum_steady + cpdc->cap_sum_turb;
+	u64 util = cpdc->avg_util_wall_sum;
 
-	if (!acpus)
+	if (!cap)
 		return false;
-	return (u64)cpdc->avg_util_wall_sum > (u64)pct * acpus;
+	return util * LAVD_SCALE < (u64)(LAVD_SCALE - req) * cap;
 }
 
 /*
@@ -560,10 +587,16 @@ struct cpu_ctx {
  */
 struct mm_ca_stat {
 	struct bpf_spin_lock	lock;
-	u8	preferred_cpdom_id;			/* LLC domain with highest accumulated runtime */
+	u8	preferred_cpdom_id;			/* LLC domain with highest occupancy */
 	u8	__pad[3];
 	u32	cpdom_runtime[LAVD_CA_MAX_CPDOMS];	/* per-LLC decayed runtime (ns >> 10) */
 	u64	last_epoch_ns;				/* timestamp of the last epoch advance */
+	u64	next_scan_ns;				/* earliest next preferred-LLC scan time;
+							 * check-and-set under the lock so the scan
+							 * runs at most once per epoch per process */
+	u64	last_scan_ns;				/* last time the process ran on its
+							 * preferred domain; drives the
+							 * LAVD_CA_AFFINITY_TIMEOUT_NS expiry */
 };
 
 extern const volatile u64	nr_llcs;	/* number of LLC domains */
