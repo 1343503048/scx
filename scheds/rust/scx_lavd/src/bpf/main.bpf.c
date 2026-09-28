@@ -1067,20 +1067,94 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	}
 
 	/*
-	 * Calculate when a task can be scheduled for how long.
-	 *
-	 * If the task is re-enqueued due to a higher-priority scheduling class
-	 * taking the CPU, we don't need to recalculate the task's deadline and
-	 * timeslice, as the task hasn't yet run.
+	 * A reenqueue (SCX_ENQ_REENQ) means the task was already placed once
+	 * but bounced -- e.g., a higher-priority class (RT/DL) took the CPU
+	 * and the local DSQ was drained via scx_bpf_reenqueue_local() (from
+	 * ops.cpu_release), or the DSQ it sat on was destroyed. A REENQ
+	 * arrives at ops.enqueue() directly, without going through
+	 * select_task_rq(), so there is no fresh CPU choice to honor.
 	 */
-	if (!(enq_flags & SCX_ENQ_REENQ)) {
-		if (enq_flags & SCX_ENQ_WAKEUP)
-			set_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
-		else
-			reset_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
+	if (unlikely(enq_flags & SCX_ENQ_REENQ)) {
+		/*
+		 * If the task's cgroup is throttled, the task should be
+		 * backlogged and its accounted load should be reverted,
+		 * since the task is no longer in a DSQ. The queued-load
+		 * accounting from the original enqueue is still live: the
+		 * reenqueue paths bypass ops.dequeue().
+		 */
+		if (enable_cpu_bw && (p->pid != lavd_pid) &&
+		    (cgroup_throttled(p, taskc, true) == -EAGAIN)) {
+			unaccount_queued_load(taskc);
 
+			debugln("Task %s[pid%d/cgid%llu] is throttled.",
+				p->comm, p->pid, taskc->cgrp_id);
+			return;
+		}
+
+		/*
+		 * The task has not run since, so its slice and CPU choice
+		 * are still valid -- reuse the cached suggested_cpu_id and
+		 * reinsert into the previously chosen domain DSQ, never the
+		 * local DSQ it was just drained from.
+		 *
+		 * suggested_cpu_id may be stale. It was set by a previous
+		 * ops.select_cpu()/ops.enqueue(), and meanwhile cpus_ptr can
+		 * change underneath (migrate_disable() narrowing cpus_ptr,
+		 * sched_setaffinity() or cgroup migration, CPU hotplug).
+		 * Clamp to cpus_ptr to prevent routing the task to a CPU
+		 * that cannot run it.
+		 */
+		cpu = taskc->suggested_cpu_id;
+		if (cpu < 0 || cpu >= nr_cpu_ids ||
+		    !bpf_cpumask_test_cpu(cpu, p->cpus_ptr)) {
+			cpu = bpf_cpumask_first(p->cpus_ptr);
+			taskc->suggested_cpu_id = cpu;
+		}
+		cpuc = get_cpu_ctx_id(cpu);
+		if (!cpuc) {
+			scx_bpf_error("Failed to lookup cpu_ctx %d", cpu);
+			return;
+		}
+		taskc->cpdom_id = cpuc->cpdom_id;
+
+		/*
+		 * Recompute the deadline: the logical clock may have
+		 * advanced while the task was bounced, so reusing the
+		 * stale (smaller) deadline would over-prioritize it.
+		 * Re-anchor to the current clock. The time slice is kept
+		 * as is.
+		 */
 		p->scx.dsq_vtime = calc_when_to_run(p, taskc);
+
+		dsq_id = get_target_dsq_id(p, cpuc, taskc);
+		scx_bpf_dsq_insert_vtime(p, dsq_id, p->scx.slice,
+					 p->scx.dsq_vtime, enq_flags);
+		account_queued_load(taskc, cpuc->cpdom_id);
+
+		/*
+		 * Kick an idle CPU in the domain to consume the shared
+		 * domain DSQ. is_idle is never set on this path (the
+		 * LAVD_FLAG_IDLE_CPU_PICKED flag was consumed at the
+		 * original enqueue), so without this unconditional kick
+		 * nothing would be woken up to consume the shared DSQ:
+		 * the REENQ'd task sits there until some busy CPU of the
+		 * domain happens to redispatch.
+		 */
+		kick_idle_cpu_in_cpdom(MEMBER_VPTR(cpdom_ctxs,
+						   [cpuc->cpdom_id]));
+
+		goto kick_cpu_out;
 	}
+
+	/*
+	 * Calculate when a task can be scheduled for how long.
+	 */
+	if (enq_flags & SCX_ENQ_WAKEUP)
+		set_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
+	else
+		reset_task_flag(taskc, LAVD_FLAG_IS_WAKEUP);
+
+	p->scx.dsq_vtime = calc_when_to_run(p, taskc);
 	p->scx.slice = LAVD_SLICE_MIN_NS_DFL;
 
 	/*
@@ -1171,8 +1245,20 @@ void BPF_STRUCT_OPS(lavd_enqueue, struct task_struct *p, u64 enq_flags)
 	account_queued_load(taskc, cpuc->cpdom_id);
 
 	/*
-	 * If a new overflow CPU was assigned while finding a proper DSQ,
-	 * kick the new CPU and go.
+	 * The task landed on the shared domain DSQ without a claimed idle
+	 * CPU of its own. On a burst wakeup that enqueues multiple slices,
+	 * every such enqueue kicks one more idle CPU in the domain, so the
+	 * shared DSQ is consumed promptly instead of waiting for a busy
+	 * CPU's next dispatch. When is_idle, the picked CPU is already
+	 * claimed and kicked at kick_cpu_out below.
+	 */
+	if (!is_idle)
+		kick_idle_cpu_in_cpdom(MEMBER_VPTR(cpdom_ctxs,
+						   [cpuc->cpdom_id]));
+
+kick_cpu_out:
+	/*
+	 * Kick the chosen CPU if it was picked idle, so it picks up the task.
 	 */
 	if (is_idle) {
 		scx_bpf_kick_cpu(cpu, SCX_KICK_IDLE);

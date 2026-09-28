@@ -862,6 +862,7 @@ struct pick_ctx {
 
 s32 find_cpu_in(const struct cpumask *src_mask, struct cpu_ctx *cpuc_cur);
 s32  pick_idle_cpu(struct pick_ctx *ctx, bool *is_idle);
+void kick_idle_cpu_in_cpdom(struct cpdom_ctx *cpdomc);
 
 bool consume_task(u64 cpu_dsq_id, u64 cpdom_dsq_id);
 
